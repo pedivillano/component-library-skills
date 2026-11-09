@@ -122,26 +122,51 @@ object TranscriptDb {
             .delete(TABLE, "audio_name = ?", arrayOf(audioName))
     }
 
-    /** 把分段列表序列化为 JSON，供播放页同步字幕使用 */
+    /** 把分段列表序列化为 JSON（e = 结束时间；w = 词级时间数组 [词, 起, 止]；旧数据可缺省） */
     fun segmentsToJson(segments: List<SpeechTranscriber.Segment>): String {
         if (segments.isEmpty()) return ""
         return JSONArray().apply {
             segments.forEach { seg ->
-                put(JSONObject().put("s", seg.startSec.toDouble()).put("t", seg.text))
+                val o = JSONObject()
+                    .put("s", seg.startSec.toDouble())
+                    .put("e", seg.endSec.toDouble())
+                    .put("t", seg.text)
+                if (seg.words.isNotEmpty()) {
+                    o.put("w", JSONArray().apply {
+                        seg.words.forEach { w ->
+                            put(JSONArray().put(w.text).put(w.startSec.toDouble()).put(w.endSec.toDouble()))
+                        }
+                    })
+                }
+                put(o)
             }
         }.toString()
     }
 
-    /** 解析分段 JSON（兼容旧记录：空串或解析失败返回空列表） */
+    /** 解析分段 JSON（兼容旧记录：无 e/w 字段时对应字段缺省，空串或解析失败返回空列表） */
     fun parseSegments(json: String): List<SpeechTranscriber.Segment> {
         if (json.isBlank()) return emptyList()
         return runCatching {
             val arr = JSONArray(json)
             (0 until arr.length()).map { i ->
                 val o = arr.getJSONObject(i)
+                val words = mutableListOf<SpeechTranscriber.WordSpan>()
+                if (o.has("w")) {
+                    val wa = o.getJSONArray("w")
+                    for (j in 0 until wa.length()) {
+                        val w = wa.getJSONArray(j)
+                        words += SpeechTranscriber.WordSpan(
+                            text = w.getString(0),
+                            startSec = w.getDouble(1).toFloat(),
+                            endSec = w.getDouble(2).toFloat()
+                        )
+                    }
+                }
                 SpeechTranscriber.Segment(
                     startSec = o.getDouble("s").toFloat(),
-                    text = o.getString("t")
+                    endSec = if (o.has("e")) o.getDouble("e").toFloat() else 0f,
+                    text = o.getString("t"),
+                    words = words
                 )
             }
         }.getOrDefault(emptyList())

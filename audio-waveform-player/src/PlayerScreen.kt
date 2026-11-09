@@ -39,11 +39,15 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -51,6 +55,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -62,8 +67,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.myenglishlearningtool.audio.AudioExtractor
 import com.example.myenglishlearningtool.data.TranscriptDb
@@ -266,6 +275,7 @@ object WaveformExtractor {
 /**
  * 播放页：波形（红色播放头固定居中、已播放亮/未播放暗）、当前分段字幕、底部播放条。
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -383,33 +393,49 @@ fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // ---------------- 顶栏：返回主页 ----------------
-        Row(
+        // ---------------- 顶栏：标准 TopAppBar ----------------
+        // 自带状态栏避让（内容不再顶到状态栏里）、64dp 标准高度、
+        // 48dp+ 导航按钮触控目标，标题单行省略
+        TopAppBar(
+            title = {
+                Text(
+                    text = item.name.substringBeforeLast('.'),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            navigationIcon = {
+                // 48dp 标准触控目标，图标放大到 28dp 并着主题色，视觉更醒目
+                IconButton(onClick = onBack) {
+                    Icon(
+                        Icons.Filled.Home,
+                        contentDescription = "返回主页",
+                        modifier = Modifier.size(28.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            },
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            )
+        )
+
+        // ---------------- 交互主区（波形 + 字幕 + 播放条） ----------------
+        // 连片屏蔽左右边缘的系统返回手势：拖动跨界不会突然触发返回，
+        // 返回功能由左上角主页按钮承担（Android 10+ 生效，系统每侧最多 200dp）
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .weight(1f)
+                .systemGestureExclusion()
         ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.Home, contentDescription = "返回主页")
-            }
-            Text(
-                text = item.name.substringBeforeLast('.'),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                modifier = Modifier.weight(1f)
-            )
-        }
-
         // ---------------- 波形区域 ----------------
-        // systemGestureExclusion：屏蔽左右边缘的系统返回手势，
-        // 波形可以一路拖到屏幕边缘（Android 10+ 生效，系统最多允许每侧 200dp 排除区）
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(180.dp)
-                .systemGestureExclusion()   // 在 padding 之前：排除区含左右 12dp 边距
                 .padding(horizontal = 12.dp)
         ) {
             val w = wave
@@ -549,6 +575,7 @@ fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         )
+        } // 交互主区结束（边缘返回手势屏蔽到此为止）
     }
 }
 
@@ -753,11 +780,52 @@ fun TranscriptPane(
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
-    val currentIndex = segments.indexOfLast { it.startSec <= posSec + 0.01f }
+    // 字幕展示形态：phrase = 短语逐句；chunk30 = 按 30 秒聚合（词级高亮保留）
+    var mode by rememberSaveable { mutableStateOf("phrase") }
 
-    LaunchedEffect(currentIndex) {
+    // chunk30 形态：把短语按 30s 时间窗分组拼装成大段，词序列原样保留
+    val displaySegments = remember(segments, mode) {
+        if (mode != "chunk30" || segments.isEmpty()) {
+            segments
+        } else {
+            segments
+                .groupBy { maxOf(0, (it.startSec / 30).toInt()) }
+                .entries.sortedBy { it.key }
+                .map { (_, list) ->
+                    SpeechTranscriber.Segment(
+                        startSec = list.first().startSec,
+                        endSec = list.maxOf { it.endSec },
+                        text = list.joinToString(" ") { it.text.trim() },
+                        words = list.flatMap { it.words }
+                    )
+                }
+        }
+    }
+
+    // 高亮：优先用 [startSec, endSec) 精确匹配（词级对齐的新记录），
+    // 旧记录 endSec=0 时退回「最后一个已开始的分段」
+    val currentIndex = displaySegments.indexOfFirst { it.endSec > it.startSec && posSec < it.endSec }
+        .takeIf { it >= 0 && displaySegments[it].startSec <= posSec + 0.01f }
+        ?: displaySegments.indexOfLast { it.startSec <= posSec + 0.01f }
+
+    LaunchedEffect(segments) {
+        // 排查：播放页实际拿到的分段数据质量（tag: ELT_SEG）
+        Log.i(
+            "ELT_SEG",
+            "字幕分段=${segments.size} 有endSec=${segments.count { it.endSec > it.startSec }} " +
+                "有词级=${segments.count { it.words.isNotEmpty() }} " +
+                "总词数=${segments.sumOf { it.words.size }}"
+        )
+    }
+
+    LaunchedEffect(currentIndex, mode) {
         if (currentIndex >= 0) {
             runCatching { listState.animateScrollToItem(currentIndex) }
+            val seg = displaySegments.getOrNull(currentIndex)
+            Log.i(
+                "ELT_SEG",
+                "形态=$mode 高亮段#$currentIndex [${seg?.startSec}..${seg?.endSec}] words=${seg?.words?.size}"
+            )
         }
     }
 
@@ -767,7 +835,26 @@ fun TranscriptPane(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
         )
     ) {
-        if (segments.isEmpty()) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // 形态切换
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                FilterChip(
+                    selected = mode == "phrase",
+                    onClick = { mode = "phrase" },
+                    label = { Text("逐句") }
+                )
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = mode == "chunk30",
+                    onClick = { mode = "chunk30" },
+                    label = { Text("30秒") }
+                )
+            }
+        if (displaySegments.isEmpty()) {
             Text(
                 text = "暂无转写内容\n请先回到主页对该音频进行「转文字」",
                 style = MaterialTheme.typography.bodyMedium,
@@ -780,15 +867,52 @@ fun TranscriptPane(
         } else {
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
                     horizontal = 16.dp, vertical = 12.dp
                 )
             ) {
-                itemsIndexed(segments) { index, seg ->
+                itemsIndexed(displaySegments) { index, seg ->
                     val current = index == currentIndex
+                    // 当前段内逐词高亮：找到 posSec 所在的词（最后一个已开始的词）
+                    val wordIdx = if (current && seg.words.isNotEmpty()) {
+                        seg.words.indexOfLast { it.startSec <= posSec }
+                            .takeIf { idx ->
+                                idx >= 0 && posSec < maxOf(
+                                    seg.words[idx].endSec,
+                                    seg.words[idx].startSec + 0.2f
+                                )
+                            } ?: -1
+                    } else -1
+
+                    val text = if (seg.words.isNotEmpty() && current) {
+                        // 当前段：词级高亮的富文本（当前词加底色加粗）
+                        buildAnnotatedString {
+                            append("[${formatClock(seg.startSec)}] ")
+                            seg.words.forEachIndexed { wi, w ->
+                                val start = length
+                                append(w.text)
+                                append(" ")
+                                if (wi == wordIdx) {
+                                    addStyle(
+                                        SpanStyle(
+                                            background = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        start,
+                                        length
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        AnnotatedString("[${formatClock(seg.startSec)}] ${seg.text}")
+                    }
+
                     Text(
-                        text = "[${formatClock(seg.startSec)}] ${seg.text}",
+                        text = text,
                         style = if (current) {
                             MaterialTheme.typography.bodyLarge
                         } else {
@@ -807,6 +931,7 @@ fun TranscriptPane(
                 }
             }
         }
+        } // 内层 Column 结束（一个闭合 if/else，一个闭合 Column）
     }
 }
 

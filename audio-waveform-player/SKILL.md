@@ -1,8 +1,8 @@
 # 技能：音频波形播放组件（Audio Waveform Player）
 
-> 版本：1.0 | 语言：Kotlin + Jetpack Compose (Material3) | 最低 API：26（MediaCodec 建议 21+）
+> 版本：1.1 | 语言：Kotlin + Jetpack Compose (Material3) | 最低 API：26（MediaCodec 建议 21+）
 
-一个开箱即用的 Android 音频播放页面组件：**响度波形 + 红色播放头 + 同步字幕 + 底部滚动条**，
+一个开箱即用的 Android 音频播放页面组件：**响度波形 + 红色播放头 + 词级同步字幕 + 底部滚动条**，
 三种手势（拖波形 / 拖红线 / 拖底部滑块）完全独立、逐帧 60fps 平滑跟手。
 
 ## 能力清单
@@ -16,12 +16,14 @@
 | 底部滑块 | = 视窗滚动条（滑到最右 = 音轨末端对齐屏幕右缘），拖动时红线钉屏 |
 | 逐帧插值 | 每 200ms 查询播放器锚点 + `withFrameNanos` 每帧推算，播放头丝滑无跳格 |
 | 时间轴网格对齐 | 波形条固定在全局时间轴区间上，平移时亚像素级真实滑动（非原地变形） |
-| 屏蔽边缘返回 | 波形区 `systemGestureExclusion()`，可一路拖到屏幕边缘不触发系统返回 |
-| 同步字幕 | 按 `TranscriptDb` 分段 JSON 高亮当前句并自动滚动 |
+| 屏蔽边缘返回 | 交互主区（波形+字幕+播放条）`systemGestureExclusion()` 连片屏蔽，可一路拖到屏幕边缘 |
+| 词级同步字幕 | whisper token 时间戳（或能量插值兜底）实现短语级分段 + 卡拉OK式逐词高亮 |
+| 双形态字幕 | 「逐句」（1~4s 短语）/「30秒」（聚合大段，词级高亮保留）一键切换 |
+| 普通/精细识别 | 普通 30s/块（快）；精细 10s/块（词级时间更准，耗时约 3 倍），识别时可选 |
 
 ## 集成步骤
 
-1. 复制 `src/PlayerScreen.kt`、`src/TranscriptDb.kt` 到你的模块源码目录（包名按需修改）。
+1. 复制 `src/PlayerScreen.kt`、`src/TranscriptDb.kt`、`src/SpeechTranscriber.kt` 到你的模块源码目录（包名按需修改）。
 2. `build.gradle.kts` 依赖：
 
 ```kotlin
@@ -30,6 +32,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.lifecycle:lifecycle-runtime-compose")
+    implementation(files("libs/sherpa-onnx-2.x.x.aar"))  // 词级对齐字幕需要
 }
 ```
 
@@ -85,13 +88,27 @@ grabHalf = 22.dp        // 红线抓取区半宽
 11. **先清状态再读状态**：`seekTo` 内清空冻结视窗后，外层再读该值得到 null →
     视窗被意外重置回跟随模式，每次拖红线都重新锚定、误差累积「越拖越前」→
     先把冻结值存进局部变量再 seek。
+12. **sherpa-onnx whisper 词级时间戳默认关闭**：`OfflineRecognizerResult.tokens` 有值但
+    `timestamps` 是空数组 → 必须显式设置 `OfflineWhisperModelConfig(enableTokenTimestamps = true,
+    enableSegmentTimestamps = true)`。
+13. **开了开关时间戳仍为空**（部分模型/版本 native 层不填）→ 兜底方案：
+    100ms 帧能量检测出块内语音段（间隔 ≤300ms 合并），token 按字符量加权在语音段内插值，
+    **静音不摊时间**（这是主要误差源）；代码保留真实时间戳自动升级路径。
+14. **whisper 30s 块是模型原生窗口**：编码器固定处理 30s 频谱图，切块更小模型精度不变、
+    单块耗时不变、总耗时线性上涨（10s 块 = 3 倍耗时）→ 只在插值误差可感知时才用精细模式。
+15. **Compose 包裹层少一个闭合大括号**：给现有结构包进新 `Column` 时补了一个 `}` 而需要两个 →
+    后续所有顶层函数变成「局部函数」，产生几十个 Unresolved 连锁误报 →
+    用逐行大括号深度脚本（剥离字符串/注释后计 `{}`）快速定位。
+16. **Material3 `TopAppBar` 是实验性 API**：函数上需 `@OptIn(ExperimentalMaterial3Api::class)`。
+    顺带收益：自带状态栏避让和 64dp 标准工具栏高度。
 
 ## 文件结构
 
 ```
 audio-waveform-player/
-├── SKILL.md              ← 本文件
+├── SKILL.md                ← 本文件
 └── src/
-    ├── PlayerScreen.kt   ← 播放页全部组件（波形、手势、字幕、播放条）
-    └── TranscriptDb.kt   ← 转写记录 SQLite 存储（含分段 JSON 解析）
+    ├── PlayerScreen.kt     ← 播放页全部组件（波形、手势、字幕双形态、播放条）
+    ├── TranscriptDb.kt     ← 转写记录 SQLite 存储（分段 JSON 含词级时间）
+    └── SpeechTranscriber.kt ← whisper 离线转写（词级对齐切分、语音段插值、普通/精细模式）
 ```
