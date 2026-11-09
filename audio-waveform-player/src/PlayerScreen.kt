@@ -14,6 +14,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.systemGestureExclusion
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -76,6 +77,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToLong
@@ -373,6 +376,9 @@ fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
         lineDragWindowStart = null
         // 注意：不重置视窗。滑块/视窗只由滑块拖动、波形平移和「点播放」控制
         positionMs = ms.toInt().coerceIn(0, displayDurationMs)
+        // 重置插值锚点，否则播放中 seek 后会被旧锚点拽回去（最多 200ms）
+        anchorMs = positionMs
+        anchorNanos = System.nanoTime()
         runCatching { player.seekTo(ms.roundToLong().toInt()) }
     }
 
@@ -397,10 +403,13 @@ fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
         }
 
         // ---------------- 波形区域 ----------------
+        // systemGestureExclusion：屏蔽左右边缘的系统返回手势，
+        // 波形可以一路拖到屏幕边缘（Android 10+ 生效，系统最多允许每侧 200dp 排除区）
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(180.dp)
+                .systemGestureExclusion()   // 在 padding 之前：排除区含左右 12dp 边距
                 .padding(horizontal = 12.dp)
         ) {
             val w = wave
@@ -598,8 +607,10 @@ fun WaveformView(
                             ).coerceIn(0f, 1f) * size.width
                         if (abs(offset.x - lineX) <= grabHalfPx) return@detectTapGestures
                         if (wave.durationSec > 0f) {
+                            // 必须用 currentViewStart（实时值），
+                            // 参数 viewStartSec 是 pointerInput 首帧捕获的旧值
                             tapState(
-                                (viewStartSec + offset.x / size.width * WAVE_WINDOW_SEC)
+                                (currentViewStart + offset.x / size.width * WAVE_WINDOW_SEC)
                                     .coerceIn(0f, wave.durationSec)
                             )
                         }
@@ -629,27 +640,45 @@ fun WaveformView(
         ) {
             if (wave.durationSec <= 0f) return@Canvas
 
-            val secondsPerPx = WAVE_WINDOW_SEC / size.width
-            val barDurationSec = wave.durationSec / wave.bars.size
-
             val spacingPx = 6.dp.toPx()
             val barWidthPx = 4.dp.toPx()
             val cornerPx = 2.dp.toPx()
-            val barCount = (size.width / spacingPx).toInt().coerceAtLeast(1)
             val amplitudeRange = size.height * 0.84f
             val minBar = 3.dp.toPx()
 
-            for (i in 0 until barCount) {
-                val t = viewStartSec + (i * spacingPx + spacingPx / 2f) * secondsPerPx
-                if (t < 0f || t > wave.durationSec) continue
-                val barIndex = (t / barDurationSec).toInt().coerceIn(0, wave.bars.lastIndex)
-                val amp = wave.bars[barIndex].pow(0.6f)
+            // 时间轴网格对齐：每根条固定属于全局时间轴上的一个区间，
+            // x 由「条时间 - 视窗起点」换算 → 平移时波形亚像素级连续滑动，
+            // 高度跟随时间区间固定不变（不再是在屏幕网格上原地变形）
+            val secPerPx = WAVE_WINDOW_SEC / size.width
+            val barTimeSpan = spacingPx * secPerPx
+            val barsTotal = wave.bars.size
+            val srcBarSec = wave.durationSec / barsTotal
+
+            val firstK = floor(viewStartSec / barTimeSpan).toInt()
+            val lastK = ceil((viewStartSec + WAVE_WINDOW_SEC) / barTimeSpan).toInt()
+
+            for (k in firstK until lastK) {
+                val tStart = k * barTimeSpan
+                val tCenter = tStart + barTimeSpan / 2f
+                if (tCenter < 0f || tCenter > wave.durationSec) continue
+                val x = (tStart - viewStartSec) * size.width / WAVE_WINDOW_SEC
+                if (x > size.width || x + spacingPx < 0f) continue
+                // 该时间区间覆盖的源波形条，取峰值
+                val from = (tStart / srcBarSec).toInt().coerceIn(0, barsTotal - 1)
+                val to = (((tStart + barTimeSpan) / srcBarSec).toInt())
+                    .coerceAtLeast(from + 1)
+                    .coerceAtMost(barsTotal)
+                var peak = 0f
+                for (j in from until to) {
+                    if (wave.bars[j] > peak) peak = wave.bars[j]
+                }
+                val amp = peak.pow(0.6f)
                 val barHeight = (amp * amplitudeRange).coerceAtLeast(minBar)
-                val x = i * spacingPx + (spacingPx - barWidthPx) / 2f
+                val bx = x + (spacingPx - barWidthPx) / 2f
                 val y0 = (size.height - barHeight) / 2f
                 drawRoundRect(
-                    color = if (t <= posSec) playedColor else restColor,
-                    topLeft = Offset(x, y0),
+                    color = if (tCenter <= posSec) playedColor else restColor,
+                    topLeft = Offset(bx, y0),
                     size = Size(barWidthPx, barHeight),
                     cornerRadius = CornerRadius(cornerPx)
                 )
