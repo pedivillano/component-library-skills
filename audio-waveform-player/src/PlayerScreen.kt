@@ -74,6 +74,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.BackHandler
 import com.example.myenglishlearningtool.audio.AudioExtractor
 import com.example.myenglishlearningtool.data.TranscriptDb
 import com.example.myenglishlearningtool.data.TranscriptRecord
@@ -279,6 +280,9 @@ object WaveformExtractor {
 @Composable
 fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
     val context = LocalContext.current
+
+    // 拦截系统返回手势/按键：回应用内主页，而不是退出应用
+    BackHandler { onBack() }
 
     var wave by remember { mutableStateOf<WaveformData?>(null) }
     var loadError by remember { mutableStateOf<String?>(null) }
@@ -517,6 +521,8 @@ fun PlayerScreen(item: AudioExtractor.AudioFileItem, onBack: () -> Unit) {
         TranscriptPane(
             segments = segments,
             posSec = displayMs / 1000f,
+            audioName = item.name,
+            transcriptText = record?.transcript ?: "",
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
@@ -777,6 +783,8 @@ fun WaveformView(
 fun TranscriptPane(
     segments: List<SpeechTranscriber.Segment>,
     posSec: Float,
+    audioName: String,
+    transcriptText: String,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -819,7 +827,7 @@ fun TranscriptPane(
     }
 
     LaunchedEffect(currentIndex, mode) {
-        if (currentIndex >= 0) {
+        if (currentIndex >= 0 && mode != "vocab") {
             runCatching { listState.animateScrollToItem(currentIndex) }
             val seg = displaySegments.getOrNull(currentIndex)
             Log.i(
@@ -853,8 +861,23 @@ fun TranscriptPane(
                     onClick = { mode = "chunk30" },
                     label = { Text("30秒") }
                 )
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = mode == "vocab",
+                    onClick = { mode = "vocab" },
+                    label = { Text("词汇") }
+                )
             }
-        if (displaySegments.isEmpty()) {
+        if (mode == "vocab") {
+            // 词汇面板：本录音的 AI 词汇笔记（词组可打星，删除不影响转写）
+            VocabPanel(
+                audioName = audioName,
+                transcriptProvider = { transcriptText },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        } else if (displaySegments.isEmpty()) {
             Text(
                 text = "暂无转写内容\n请先回到主页对该音频进行「转文字」",
                 style = MaterialTheme.typography.bodyMedium,
